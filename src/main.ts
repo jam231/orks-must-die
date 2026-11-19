@@ -12,7 +12,7 @@ function bootstrap(): void {
     throw new Error('Missing #game-canvas or #hud-root element');
   }
 
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { alpha: false });
   if (!ctx) {
     throw new Error('Failed to obtain 2D canvas context');
   }
@@ -26,7 +26,9 @@ function bootstrap(): void {
   const resizeCanvas = (refitCamera = false): void => {
     viewportW = Math.max(320, window.innerWidth);
     viewportH = Math.max(320, window.innerHeight);
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const isCoarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+    const maxDpr = isCoarsePointer ? 1.5 : 2;
+    const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
     canvas.width = Math.round(viewportW * dpr);
     canvas.height = Math.round(viewportH * dpr);
     canvas.style.width = `${viewportW}px`;

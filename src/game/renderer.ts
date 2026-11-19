@@ -1,5 +1,6 @@
 import { AssetAtlas, SpriteEntry } from './assets';
 import {
+  computeMapWorldBounds,
   getTileDiamond,
   getWallFaceQuad,
   gridToIso,
@@ -39,6 +40,12 @@ interface DepthDrawable {
   draw: (ctx: CanvasRenderingContext2D) => void;
 }
 
+interface CachedWallSprite {
+  canvas: HTMLCanvasElement;
+  anchorX: number; // pixel x corresponding to tile center iso x
+  anchorY: number; // pixel y corresponding to tile ground center iso y
+}
+
 const ENEMY_SPRITE_HEIGHT: Record<EnemyKind, number> = {
   kobold: 48,
   grunt: 64,
@@ -49,44 +56,109 @@ const ENEMY_SPRITE_HEIGHT: Record<EnemyKind, number> = {
 
 export class IsoRenderer {
   public atlas: AssetAtlas;
+
   private floorCache: HTMLCanvasElement[] = [];
-  private lightCanvas: HTMLCanvasElement | null = null;
-  private lightCtx: CanvasRenderingContext2D | null = null;
-  private wallPattern: CanvasPattern | null = null;
-  private floorPattern: CanvasPattern | null = null;
-  private lavaPattern: CanvasPattern | null = null;
+  private wallFullCache: CachedWallSprite[] = [];
+  private wallCutawayCache: CachedWallSprite[] = [];
+  private lavaFrames: HTMLCanvasElement[] = [];
+
+  // Pre-baked whole-map static floor + AO canvas (1 drawImage per frame!)
+  private groundMapCanvas: HTMLCanvasElement | null = null;
+  private groundMapOriginX = 0;
+  private groundMapOriginY = 0;
+  private groundMapId = '';
+  private groundMapAtlasReady = false;
+
+  // Pre-baked reusable glow stamps (zero per-frame createRadialGradient allocations!)
+  private glowAmber: HTMLCanvasElement | null = null;
+  private glowLava: HTMLCanvasElement | null = null;
+  private glowCyan: HTMLCanvasElement | null = null;
+  private glowCrimson: HTMLCanvasElement | null = null;
+  private decalScorch: HTMLCanvasElement | null = null;
+  private decalFrost: HTMLCanvasElement | null = null;
 
   constructor() {
     this.atlas = new AssetAtlas();
     if (typeof document !== 'undefined') {
-      this.lightCanvas = document.createElement('canvas');
-      this.lightCtx = this.lightCanvas.getContext('2d');
-      this.buildFloorCache(null);
+      this.buildGlowStamps();
+      this.rebuildTileCaches();
       this.atlas.onLoaded = () => {
-        this.buildFloorCache(this.atlas.texStoneFloor);
-        this.wallPattern = null;
-        this.floorPattern = null;
-        this.lavaPattern = null;
+        this.rebuildTileCaches();
+        this.groundMapId = ''; // Force static floor layer rebake with painterly textures
       };
       this.atlas.loadAll();
     }
   }
 
-  private ensurePatterns(ctx: CanvasRenderingContext2D): void {
-    if (!this.wallPattern && this.atlas.texWallMasonry) {
-      this.wallPattern = ctx.createPattern(this.atlas.texWallMasonry, 'repeat');
-    }
-    if (!this.floorPattern && this.atlas.texStoneFloor) {
-      this.floorPattern = ctx.createPattern(this.atlas.texStoneFloor, 'repeat');
-    }
-    if (!this.lavaPattern && this.atlas.texMoltenLava) {
-      this.lavaPattern = ctx.createPattern(this.atlas.texMoltenLava, 'repeat');
-    }
+  private buildGlowStamps(): void {
+    const makeGlow = (
+      size: number,
+      stops: Array<[number, string]>
+    ): HTMLCanvasElement => {
+      const c = document.createElement('canvas');
+      c.width = size;
+      c.height = size;
+      const g = c.getContext('2d');
+      if (g) {
+        const half = size * 0.5;
+        const grad = g.createRadialGradient(half, half, 0, half, half, half);
+        for (const [offset, col] of stops) {
+          grad.addColorStop(offset, col);
+        }
+        g.fillStyle = grad;
+        g.fillRect(0, 0, size, size);
+      }
+      return c;
+    };
+
+    this.glowAmber = makeGlow(128, [
+      [0, 'rgba(255, 210, 120, 0.55)'],
+      [0.4, 'rgba(255, 148, 48, 0.24)'],
+      [1, 'rgba(255, 110, 20, 0)'],
+    ]);
+    this.glowLava = makeGlow(128, [
+      [0, 'rgba(255, 175, 64, 0.42)'],
+      [0.45, 'rgba(255, 86, 22, 0.20)'],
+      [1, 'rgba(200, 36, 8, 0)'],
+    ]);
+    this.glowCyan = makeGlow(128, [
+      [0, 'rgba(155, 252, 255, 0.62)'],
+      [0.4, 'rgba(56, 214, 245, 0.26)'],
+      [1, 'rgba(20, 140, 210, 0)'],
+    ]);
+    this.glowCrimson = makeGlow(128, [
+      [0, 'rgba(255, 108, 52, 0.50)'],
+      [0.5, 'rgba(195, 36, 20, 0.20)'],
+      [1, 'rgba(140, 16, 12, 0)'],
+    ]);
+    this.decalScorch = makeGlow(96, [
+      [0, 'rgba(10, 8, 8, 0.78)'],
+      [0.6, 'rgba(42, 22, 14, 0.42)'],
+      [1, 'rgba(10, 8, 8, 0)'],
+    ]);
+    this.decalFrost = makeGlow(96, [
+      [0, 'rgba(180, 248, 255, 0.36)'],
+      [0.7, 'rgba(88, 212, 245, 0.18)'],
+      [1, 'rgba(88, 212, 245, 0)'],
+    ]);
+  }
+
+  private rebuildTileCaches(): void {
+    this.buildFloorCache(this.atlas.texStoneFloor);
+    this.wallFullCache = [
+      this.bakeWallSprite(ISO_WALL_H, 0),
+      this.bakeWallSprite(ISO_WALL_H, 1),
+    ];
+    this.wallCutawayCache = [
+      this.bakeWallSprite(16, 0),
+      this.bakeWallSprite(16, 1),
+    ];
+    this.buildLavaFrames(this.atlas.texMoltenLava);
   }
 
   private buildFloorCache(stoneTex: HTMLImageElement | null): void {
     this.floorCache = [];
-    const pad = 6;
+    const pad = 4;
     const w = ISO_TILE_W + pad * 2;
     const h = ISO_TILE_H + pad * 2;
     const cx = w * 0.5;
@@ -119,7 +191,6 @@ export class IsoRenderer {
       if (stoneTex) {
         g.save();
         g.clip();
-        // Draw painterly flagstone texture squashed into crisp 2:1 isometric perspective
         const [sx, sy] = cropOffsets[v];
         const cropSize = 210;
         g.translate(cx, cy);
@@ -139,8 +210,8 @@ export class IsoRenderer {
         );
         g.restore();
 
-        // Subtle unifying dungeon tint so characters & traps pop cleanly
-        g.fillStyle = v % 2 === 0 ? 'rgba(34, 42, 56, 0.24)' : 'rgba(26, 32, 44, 0.30)';
+        // Balanced cool slate glaze so traps & characters stay super readable
+        g.fillStyle = v % 2 === 0 ? 'rgba(30, 38, 52, 0.24)' : 'rgba(22, 28, 40, 0.30)';
         g.fill();
       } else {
         const grad = g.createLinearGradient(cx - hw, cy - hh, cx + hw, cy + hh);
@@ -151,18 +222,18 @@ export class IsoRenderer {
         g.fill();
       }
 
-      // Warm top-left stone bevel highlight
-      g.strokeStyle = 'rgba(242, 232, 214, 0.22)';
-      g.lineWidth = 1.25;
+      // Warm stone top bevel
+      g.strokeStyle = 'rgba(242, 232, 214, 0.20)';
+      g.lineWidth = 1.2;
       g.beginPath();
       g.moveTo(cx - hw + 1.5, cy);
       g.lineTo(cx, cy - hh + 1.2);
       g.lineTo(cx + hw - 1.5, cy);
       g.stroke();
 
-      // Deep dark mortar seam
-      g.strokeStyle = 'rgba(10, 12, 16, 0.68)';
-      g.lineWidth = 1.35;
+      // Deep mortar seam
+      g.strokeStyle = 'rgba(10, 12, 16, 0.65)';
+      g.lineWidth = 1.3;
       g.beginPath();
       g.moveTo(cx, cy - hh);
       g.lineTo(cx + hw, cy);
@@ -175,6 +246,284 @@ export class IsoRenderer {
     }
   }
 
+  /**
+   * Pre-bakes a complete isometric masonry wall block (SW sheared brick face, SE sheared brick face,
+   * textured stone parapet top, and crisp bevel edges) onto an offscreen sprite.
+   * Eliminates ~250 per-frame ctx.clip() + CanvasPattern + gradient calls!
+   */
+  private bakeWallSprite(wallH: number, variant: number): CachedWallSprite {
+    const pad = 6;
+    const w = ISO_TILE_W + pad * 2;
+    const h = ISO_TILE_H + wallH + pad * 2;
+    const anchorX = w * 0.5;
+    const anchorY = pad + wallH + ISO_TILE_H * 0.5;
+
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const g = c.getContext('2d');
+    if (!g) return { canvas: c, anchorX, anchorY };
+
+    const hw = ISO_TILE_W * 0.5;
+    const hh = ISO_TILE_H * 0.5;
+
+    // Ground diamond corners relative to (anchorX, anchorY)
+    const bTop = { x: anchorX, y: anchorY - hh };
+    const bRight = { x: anchorX + hw, y: anchorY };
+    const bBot = { x: anchorX, y: anchorY + hh };
+    const bLeft = { x: anchorX - hw, y: anchorY };
+
+    // Top diamond corners extruded upward by wallH
+    const tTop = { x: bTop.x, y: bTop.y - wallH };
+    const tRight = { x: bRight.x, y: bRight.y - wallH };
+    const tBot = { x: bBot.x, y: bBot.y - wallH };
+    const tLeft = { x: bLeft.x, y: bLeft.y - wallH };
+
+    const topD: Vec2[] = [tTop, tRight, tBot, tLeft];
+    const swQuad: Vec2[] = [tLeft, tBot, bBot, bLeft];
+    const seQuad: Vec2[] = [tRight, tBot, bBot, bRight];
+
+    const wallPat = this.atlas.texWallMasonry
+      ? g.createPattern(this.atlas.texWallMasonry, 'repeat')
+      : null;
+    const floorPat = this.atlas.texStoneFloor
+      ? g.createPattern(this.atlas.texStoneFloor, 'repeat')
+      : null;
+    const texShift = variant * 110;
+
+    // SW face (left side — deeper dungeon shadow)
+    g.save();
+    this.tracePoly(g, swQuad);
+    g.clip();
+    if (wallPat) {
+      g.save();
+      g.translate(tLeft.x, tLeft.y);
+      g.transform(1, 0.5, 0, 1, 0, 0);
+      g.scale(0.18, 0.18);
+      g.translate(-texShift, 0);
+      g.fillStyle = wallPat;
+      g.fillRect(texShift - 40, -40, 420, 420);
+      g.restore();
+      const swShade = g.createLinearGradient(tLeft.x, tLeft.y, bBot.x, bBot.y);
+      swShade.addColorStop(0, 'rgba(18, 22, 34, 0.42)');
+      swShade.addColorStop(1, 'rgba(8, 10, 16, 0.66)');
+      g.fillStyle = swShade;
+      g.fill();
+    } else {
+      const swGrad = g.createLinearGradient(tLeft.x, tLeft.y, bBot.x, bBot.y);
+      swGrad.addColorStop(0, '#363b45');
+      swGrad.addColorStop(1, '#20242c');
+      this.fillPoly(g, swQuad, swGrad);
+    }
+    g.restore();
+
+    // SE face (right side — warmer torchlit midtone)
+    g.save();
+    this.tracePoly(g, seQuad);
+    g.clip();
+    if (wallPat) {
+      g.save();
+      g.translate(tRight.x, tRight.y);
+      g.transform(1, -0.5, 0, 1, 0, 0);
+      g.scale(0.18, 0.18);
+      g.translate(-texShift, 0);
+      g.fillStyle = wallPat;
+      g.fillRect(texShift - 40, -40, 420, 420);
+      g.restore();
+      const seShade = g.createLinearGradient(tRight.x, tRight.y, bBot.x, bBot.y);
+      seShade.addColorStop(0, 'rgba(30, 34, 44, 0.18)');
+      seShade.addColorStop(1, 'rgba(12, 14, 22, 0.46)');
+      g.fillStyle = seShade;
+      g.fill();
+    } else {
+      const seGrad = g.createLinearGradient(tRight.x, tRight.y, bBot.x, bBot.y);
+      seGrad.addColorStop(0, '#4a505e');
+      seGrad.addColorStop(1, '#2c303a');
+      this.fillPoly(g, seQuad, seGrad);
+    }
+    g.restore();
+
+    // Top stone parapet cap
+    g.save();
+    this.tracePoly(g, topD);
+    g.clip();
+    if (floorPat) {
+      g.save();
+      g.translate(anchorX, anchorY - wallH);
+      g.scale(0.24, 0.12);
+      g.rotate(Math.PI / 4);
+      g.translate(texShift * 0.5, -texShift * 0.3);
+      g.fillStyle = floorPat;
+      g.fillRect(-300, -300, 600, 600);
+      g.restore();
+      g.fillStyle =
+        wallH < ISO_WALL_H ? 'rgba(26, 30, 42, 0.38)' : 'rgba(66, 76, 96, 0.18)';
+      g.fill();
+    } else {
+      const capGrad = g.createLinearGradient(tLeft.x, tTop.y, tRight.x, tBot.y);
+      capGrad.addColorStop(0, wallH < ISO_WALL_H ? '#4c525f' : '#626978');
+      capGrad.addColorStop(1, wallH < ISO_WALL_H ? '#373c46' : '#474d5a');
+      this.fillPoly(g, topD, capGrad);
+    }
+    g.restore();
+
+    // Crisp stone rim highlight & dark seams
+    g.strokeStyle = 'rgba(238, 232, 222, 0.24)';
+    g.lineWidth = 1.25;
+    g.beginPath();
+    g.moveTo(tLeft.x, tLeft.y);
+    g.lineTo(tTop.x, tTop.y);
+    g.lineTo(tRight.x, tRight.y);
+    g.stroke();
+
+    g.strokeStyle = 'rgba(10, 12, 16, 0.72)';
+    g.lineWidth = 1.3;
+    this.strokePoly(g, swQuad);
+    this.strokePoly(g, seQuad);
+
+    return { canvas: c, anchorX, anchorY };
+  }
+
+  /**
+   * Pre-bakes 6 looping frames of scrolling painterly molten lava tiles (zero per-frame clip/pattern).
+   */
+  private buildLavaFrames(lavaTex: HTMLImageElement | null): void {
+    this.lavaFrames = [];
+    const pad = 4;
+    const w = ISO_TILE_W + pad * 2;
+    const h = ISO_TILE_H + pad * 2;
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const hw = ISO_TILE_W * 0.5;
+    const hh = ISO_TILE_H * 0.5;
+    const frameCount = 6;
+
+    for (let f = 0; f < frameCount; f++) {
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const g = c.getContext('2d');
+      if (!g) continue;
+
+      const d: Vec2[] = [
+        { x: cx, y: cy - hh },
+        { x: cx + hw, y: cy },
+        { x: cx, y: cy + hh },
+        { x: cx - hw, y: cy },
+      ];
+      const pulse = 0.5 + 0.5 * Math.sin((f / frameCount) * Math.PI * 2);
+
+      g.save();
+      this.tracePoly(g, d);
+      g.clip();
+
+      if (lavaTex) {
+        const pat = g.createPattern(lavaTex, 'repeat');
+        if (pat) {
+          g.save();
+          const drift = (f / frameCount) * 512;
+          g.scale(0.35, 0.19);
+          g.translate(drift, drift * 0.5);
+          g.fillStyle = pat;
+          g.fillRect(-drift - 200, -drift * 0.5 - 200, 900, 900);
+          g.restore();
+        }
+        const glow = g.createRadialGradient(cx, cy, 3, cx, cy, ISO_TILE_W * 0.5);
+        glow.addColorStop(0, `rgba(255, 224, 110, ${0.22 + 0.16 * pulse})`);
+        glow.addColorStop(0.55, `rgba(255, 110, 30, ${0.14 + 0.08 * pulse})`);
+        glow.addColorStop(1, 'rgba(32, 8, 4, 0.44)');
+        g.fillStyle = glow;
+        g.fill();
+      } else {
+        const grad = g.createRadialGradient(cx, cy, 4, cx, cy, ISO_TILE_W * 0.52);
+        grad.addColorStop(0, pulse > 0.5 ? '#ffe066' : '#ffbd45');
+        grad.addColorStop(0.45, '#f25c19');
+        grad.addColorStop(0.88, '#9e2108');
+        grad.addColorStop(1, '#3d0c05');
+        this.fillPoly(g, d, grad);
+      }
+
+      // Recessed stone drop lip
+      g.strokeStyle = '#1f1614';
+      g.lineWidth = 5;
+      g.beginPath();
+      g.moveTo(d[3].x, d[3].y);
+      g.lineTo(d[0].x, d[0].y);
+      g.lineTo(d[1].x, d[1].y);
+      g.stroke();
+
+      g.strokeStyle = 'rgba(255, 152, 56, 0.36)';
+      g.lineWidth = 1.4;
+      this.strokePoly(g, d);
+      g.restore();
+
+      this.lavaFrames.push(c);
+    }
+  }
+
+  /**
+   * Bakes the entire static floor layer (all flagstones + wall-base AO shadows + arch outlines)
+   * onto a single offscreen canvas once per map load!
+   */
+  private ensureStaticGroundMap(sim: GameSimulation): void {
+    if (
+      this.groundMapCanvas &&
+      this.groundMapId === sim.map.definition.id &&
+      this.groundMapAtlasReady === this.atlas.ready
+    ) {
+      return;
+    }
+
+    const { grid, rows, cols } = sim.map;
+    const bounds = computeMapWorldBounds(rows, cols);
+    const pad = 64;
+    const width = Math.ceil(bounds.maxX - bounds.minX + pad * 2);
+    const height = Math.ceil(bounds.maxY - bounds.minY + pad * 2);
+    const originX = -bounds.minX + pad;
+    const originY = -bounds.minY + pad;
+
+    const c = document.createElement('canvas');
+    c.width = width;
+    c.height = height;
+    const g = c.getContext('2d');
+    if (!g) return;
+
+    g.translate(originX, originY);
+
+    for (let sum = 0; sum <= rows + cols - 2; sum++) {
+      for (let gy = 0; gy < rows; gy++) {
+        const gx = sum - gy;
+        if (gx < 0 || gx >= cols) continue;
+        const cell = grid[gy][gx];
+        if (cell.type === 'void' || cell.type === 'wall' || cell.type === 'lava') continue;
+
+        const center = gridToIso(cell.gx + 0.5, cell.gy + 0.5, 0);
+        const cached = this.floorCache[cell.variant % this.floorCache.length];
+        if (cached) {
+          g.drawImage(cached, center.x - cached.width * 0.5, center.y - cached.height * 0.5);
+        }
+
+        if (cell.hasArch) {
+          const d = this.insetDiamond(getTileDiamond(cell.gx, cell.gy, 0), 0.08);
+          g.save();
+          g.strokeStyle = 'rgba(235, 186, 98, 0.42)';
+          g.lineWidth = 1.6;
+          g.setLineDash([5, 4]);
+          this.strokePoly(g, d);
+          g.restore();
+        }
+
+        this.drawWallBaseAO(g, grid, rows, cols, gx, gy);
+      }
+    }
+
+    this.groundMapCanvas = c;
+    this.groundMapOriginX = originX;
+    this.groundMapOriginY = originY;
+    this.groundMapId = sim.map.definition.id;
+    this.groundMapAtlasReady = this.atlas.ready;
+  }
+
   public render(
     ctx: CanvasRenderingContext2D,
     sim: GameSimulation,
@@ -182,21 +531,10 @@ export class IsoRenderer {
     viewportH: number,
     joystick: JoystickVisualState
   ): void {
-    this.ensurePatterns(ctx);
+    this.ensureStaticGroundMap(sim);
 
-    // 1. Rich obsidian dungeon abyss backdrop with subtle warm fortress hearth vignette
-    const bgGrad = ctx.createRadialGradient(
-      viewportW * 0.5,
-      viewportH * 0.48,
-      36,
-      viewportW * 0.5,
-      viewportH * 0.5,
-      Math.max(viewportW, viewportH) * 0.8
-    );
-    bgGrad.addColorStop(0, '#221d20');
-    bgGrad.addColorStop(0.62, '#141318');
-    bgGrad.addColorStop(1, '#08090c');
-    ctx.fillStyle = bgGrad;
+    // 1. Fast solid obsidian fill (zero 3M-pixel per-frame radial gradient rasterization on mobile!)
+    ctx.fillStyle = '#111217';
     ctx.fillRect(0, 0, viewportW, viewportH);
 
     // Camera shake
@@ -213,47 +551,51 @@ export class IsoRenderer {
     ctx.scale(sim.camera.zoom, sim.camera.zoom);
     ctx.translate(-sim.camera.x, -sim.camera.y);
 
-    // 2. Ground tiles (textured flagstones, ambient occlusion, molten lava, spawn, rift) & floor traps
-    this.drawGroundLayer(ctx, sim);
+    // 2. Single-drawImage pre-baked floor + wall AO layer!
+    if (this.groundMapCanvas) {
+      ctx.drawImage(
+        this.groundMapCanvas,
+        -this.groundMapOriginX,
+        -this.groundMapOriginY
+      );
+    }
 
-    // 3. Persistent battle decals (scorch craters, frost rime, cracks, splatters)
+    // 3. Animated lava tiles, portals, rift runes & floor traps
+    this.drawDynamicGroundElements(ctx, sim);
+
+    // 4. Persistent battle decals
     this.drawDecals(ctx, sim);
 
-    // 4. Live path preview chevrons
+    // 5. Live path preview chevrons
     this.drawPathPreviews(ctx, sim);
 
-    // 5. Placement highlights & hover ghost
+    // 6. Placement highlights & hover ghost
     this.drawPlacementOverlay(ctx, sim);
 
-    // 6. Depth-sorted 2.5D world (textured walls, arrow walls, war gates, barricades, rift, hero, orks, projectiles)
+    // 7. Depth-sorted 2.5D entities (cached wall sprites, arrow walls, barricades, rift, hero, orks, projectiles)
     this.drawDepthSortedObjects(ctx, sim);
 
-    // 7. Overhead stone archways & Ceiling Pounders
+    // 8. Overhead stone archways & Ceiling Pounders
     this.drawOverheadLayer(ctx, sim);
 
-    // 8. Spell shockwave rings & particles
+    // 9. Spell shockwave rings & particles
     this.drawRings(ctx, sim);
     this.drawParticles(ctx, sim);
 
-    ctx.restore();
+    // 10. Fast localized additive lighting & emissive glow stamps (zero full-screen multiply readback!)
+    this.drawFastAdditiveLighting(ctx, sim);
 
-    // 9. Dynamic 2D Lightmap (multiply torch/lava/rift illumination + subtle emissive bloom)
-    this.drawDynamicLighting(ctx, sim, viewportW, viewportH, shakeX, shakeY);
-
-    // 10. Crisp unlit world-space floating combat text (above lighting for maximum legibility!)
-    ctx.save();
-    ctx.translate(viewportW * 0.5 + shakeX, viewportH * 0.5 + shakeY);
-    ctx.scale(sim.camera.zoom, sim.camera.zoom);
-    ctx.translate(-sim.camera.x, -sim.camera.y);
+    // 11. Crisp floating combat text
     this.drawFloatingTexts(ctx, sim);
+
     ctx.restore();
 
-    // 11. Screen-space floating virtual joystick visual
+    // 12. Screen-space floating virtual joystick visual
     if (joystick.active) {
       this.drawJoystick(ctx, joystick);
     }
 
-    // 12. Screen-space inspected trap selection ring
+    // 13. Screen-space inspected trap selection ring
     if (sim.inspectedTrapId !== null) {
       const trap = sim.traps.find((t) => t.id === sim.inspectedTrapId);
       if (trap) {
@@ -271,70 +613,37 @@ export class IsoRenderer {
     }
   }
 
-  private drawGroundLayer(ctx: CanvasRenderingContext2D, sim: GameSimulation): void {
+  private drawDynamicGroundElements(
+    ctx: CanvasRenderingContext2D,
+    sim: GameSimulation
+  ): void {
     const { grid, rows, cols } = sim.map;
-    const floorTrapMap = new Map<string, PlacedTrap>();
-    for (const t of sim.traps) {
-      const surf = TRAP_SPECS[t.kind].surface;
-      if (surf === 'floor') {
-        floorTrapMap.set(`${t.gx},${t.gy}`, t);
-      }
-    }
+    const frameCount = this.lavaFrames.length;
+    const baseFrame = Math.floor(sim.time * 4.5);
 
-    for (let sum = 0; sum <= rows + cols - 2; sum++) {
-      for (let gy = 0; gy < rows; gy++) {
-        const gx = sum - gy;
-        if (gx < 0 || gx >= cols) continue;
+    for (let gy = 0; gy < rows; gy++) {
+      for (let gx = 0; gx < cols; gx++) {
         const cell = grid[gy][gx];
-        if (cell.type === 'void' || cell.type === 'wall') continue;
-
-        if (cell.type === 'lava') {
-          this.drawLavaTile(ctx, gx, gy, sim.time);
-        } else {
-          this.drawFloorTile(ctx, cell);
-          this.drawWallBaseAO(ctx, grid, rows, cols, gx, gy);
-
-          if (cell.type === 'spawn') {
-            this.drawSpawnPortalGround(ctx, gx, gy, sim.time);
-          } else if (cell.type === 'rift') {
-            this.drawRiftGroundBase(ctx, gx, gy, sim.time);
-          }
+        if (cell.type === 'lava' && frameCount > 0) {
+          const center = gridToIso(gx + 0.5, gy + 0.5, 0);
+          const sprite = this.lavaFrames[(baseFrame + gx + gy) % frameCount];
+          ctx.drawImage(sprite, center.x - sprite.width * 0.5, center.y - sprite.height * 0.5);
+        } else if (cell.type === 'spawn') {
+          this.drawSpawnPortalGround(ctx, gx, gy, sim.time);
+        } else if (cell.type === 'rift') {
+          this.drawRiftGroundBase(ctx, gx, gy, sim.time);
         }
+      }
+    }
 
-        const fTrap = floorTrapMap.get(`${gx},${gy}`);
-        if (fTrap) {
-          this.drawFloorTrap(ctx, fTrap, sim.time);
-        }
+    // Floor traps
+    for (const t of sim.traps) {
+      if (TRAP_SPECS[t.kind].surface === 'floor') {
+        this.drawFloorTrap(ctx, t, sim.time);
       }
     }
   }
 
-  private drawFloorTile(ctx: CanvasRenderingContext2D, cell: Cell): void {
-    const center = gridToIso(cell.gx + 0.5, cell.gy + 0.5, 0);
-    const cached = this.floorCache[cell.variant % this.floorCache.length];
-    if (cached) {
-      ctx.drawImage(cached, center.x - cached.width * 0.5, center.y - cached.height * 0.5);
-    } else {
-      const d = getTileDiamond(cell.gx, cell.gy, 0);
-      this.fillPoly(ctx, d, '#3d424c');
-    }
-
-    // Engraved brass anchor frame on Archway tiles
-    if (cell.hasArch) {
-      const d = this.insetDiamond(getTileDiamond(cell.gx, cell.gy, 0), 0.08);
-      ctx.save();
-      ctx.strokeStyle = 'rgba(235, 186, 98, 0.42)';
-      ctx.lineWidth = 1.6;
-      ctx.setLineDash([5, 4]);
-      this.strokePoly(ctx, d);
-      ctx.restore();
-    }
-  }
-
-  /**
-   * Draws soft stone ambient-occlusion contact shadows cast onto floor tiles
-   * from adjacent NW (gx-1, gy) and NE (gx, gy-1) masonry walls.
-   */
   private drawWallBaseAO(
     ctx: CanvasRenderingContext2D,
     grid: Cell[][],
@@ -361,9 +670,8 @@ export class IsoRenderer {
       const edgeMidX = (d[0].x + d[3].x) * 0.5;
       const edgeMidY = (d[0].y + d[3].y) * 0.5;
       const g = ctx.createLinearGradient(edgeMidX, edgeMidY, center.x + 6, center.y + 3);
-      g.addColorStop(0, 'rgba(5, 7, 11, 0.62)');
+      g.addColorStop(0, 'rgba(5, 7, 11, 0.56)');
       g.addColorStop(1, 'rgba(5, 7, 11, 0)');
-      ctx.fillStyle = g;
       this.fillPoly(ctx, d, g);
     }
 
@@ -371,15 +679,13 @@ export class IsoRenderer {
       const edgeMidX = (d[0].x + d[1].x) * 0.5;
       const edgeMidY = (d[0].y + d[1].y) * 0.5;
       const g = ctx.createLinearGradient(edgeMidX, edgeMidY, center.x - 6, center.y + 3);
-      g.addColorStop(0, 'rgba(5, 7, 11, 0.55)');
+      g.addColorStop(0, 'rgba(5, 7, 11, 0.50)');
       g.addColorStop(1, 'rgba(5, 7, 11, 0)');
-      ctx.fillStyle = g;
       this.fillPoly(ctx, d, g);
     }
 
     if (wallSW || wallSE) {
-      // Subtle lower-rim inner lip shadow
-      ctx.strokeStyle = 'rgba(5, 7, 11, 0.32)';
+      ctx.strokeStyle = 'rgba(5, 7, 11, 0.30)';
       ctx.lineWidth = 4;
       ctx.beginPath();
       if (wallSW) {
@@ -396,82 +702,6 @@ export class IsoRenderer {
     ctx.restore();
   }
 
-  private drawLavaTile(
-    ctx: CanvasRenderingContext2D,
-    gx: number,
-    gy: number,
-    time: number
-  ): void {
-    const topD = getTileDiamond(gx, gy, 0);
-    const center = gridToIso(gx + 0.5, gy + 0.5, -4);
-    const pulse = 0.5 + 0.5 * Math.sin(time * 2.5 + gx * 0.9 + gy * 1.3);
-
-    ctx.save();
-    this.tracePoly(ctx, topD);
-    ctx.clip();
-
-    if (this.lavaPattern) {
-      ctx.save();
-      // Gently drift the molten lava texture for living magma flow!
-      const driftX = time * 6.5;
-      const driftY = time * 3.8;
-      ctx.translate(driftX, driftY);
-      ctx.scale(0.36, 0.2);
-      ctx.fillStyle = this.lavaPattern;
-      ctx.fillRect(
-        (center.x - driftX - 90) / 0.36,
-        (center.y - driftY - 60) / 0.2,
-        180 / 0.36,
-        120 / 0.2
-      );
-      ctx.restore();
-
-      // Breathing incandescent core highlight
-      const glow = ctx.createRadialGradient(
-        center.x,
-        center.y,
-        3,
-        center.x,
-        center.y,
-        ISO_TILE_W * 0.5
-      );
-      glow.addColorStop(0, `rgba(255, 224, 110, ${0.22 + 0.16 * pulse})`);
-      glow.addColorStop(0.55, `rgba(255, 110, 30, ${0.14 + 0.08 * pulse})`);
-      glow.addColorStop(1, 'rgba(32, 8, 4, 0.45)');
-      ctx.fillStyle = glow;
-      ctx.fill();
-    } else {
-      const grad = ctx.createRadialGradient(
-        center.x,
-        center.y,
-        4,
-        center.x,
-        center.y,
-        ISO_TILE_W * 0.52
-      );
-      grad.addColorStop(0, pulse > 0.5 ? '#ffe066' : '#ffbd45');
-      grad.addColorStop(0.45, '#f25c19');
-      grad.addColorStop(0.88, '#9e2108');
-      grad.addColorStop(1, '#3d0c05');
-      this.fillPoly(ctx, topD, grad);
-    }
-
-    // Recessed charred stone channel drop lip along upper edges
-    ctx.strokeStyle = '#1f1614';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.moveTo(topD[3].x, topD[3].y);
-    ctx.lineTo(topD[0].x, topD[0].y);
-    ctx.lineTo(topD[1].x, topD[1].y);
-    ctx.stroke();
-
-    // Subtle molten heat edge shimmer
-    ctx.strokeStyle = 'rgba(255, 146, 52, 0.36)';
-    ctx.lineWidth = 1.4;
-    this.strokePoly(ctx, topD);
-    ctx.restore();
-  }
-
   private drawSpawnPortalGround(
     ctx: CanvasRenderingContext2D,
     gx: number,
@@ -479,26 +709,21 @@ export class IsoRenderer {
     time: number
   ): void {
     const center = gridToIso(gx + 0.5, gy + 0.5, 0);
-    const pulse = 0.65 + 0.35 * Math.sin(time * 4.2);
+    const pulse = 0.72 + 0.28 * Math.sin(time * 4.2);
 
     ctx.save();
-    const grad = ctx.createRadialGradient(center.x, center.y, 2, center.x, center.y, 38);
-    grad.addColorStop(0, `rgba(255, 112, 42, ${0.82 * pulse})`);
-    grad.addColorStop(0.55, `rgba(186, 36, 18, ${0.46 * pulse})`);
-    grad.addColorStop(1, 'rgba(186, 36, 18, 0)');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.ellipse(center.x, center.y, 38, 19, 0, 0, Math.PI * 2);
-    ctx.fill();
+    if (this.glowCrimson) {
+      ctx.globalAlpha = pulse;
+      ctx.drawImage(this.glowCrimson, center.x - 42, center.y - 22, 84, 44);
+      ctx.globalAlpha = 1;
+    }
 
-    // Iron war grate bars
     ctx.strokeStyle = '#1b1414';
     ctx.lineWidth = 2.6;
     ctx.beginPath();
     ctx.ellipse(center.x, center.y, 24, 12, 0, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Iron war gate side bollards rising subtly at portal corners
     const leftPost = gridToIso(gx + 0.15, gy + 0.15, 0);
     const rightPost = gridToIso(gx + 0.85, gy + 0.15, 0);
     ctx.strokeStyle = '#363a44';
@@ -527,19 +752,15 @@ export class IsoRenderer {
     time: number
   ): void {
     const center = gridToIso(gx + 0.5, gy + 0.5, 0);
-    const pulse = 0.72 + 0.28 * Math.sin(time * 3.4);
+    const pulse = 0.76 + 0.24 * Math.sin(time * 3.4);
 
     ctx.save();
-    const grad = ctx.createRadialGradient(center.x, center.y, 4, center.x, center.y, 50);
-    grad.addColorStop(0, `rgba(140, 252, 255, ${0.8 * pulse})`);
-    grad.addColorStop(0.45, `rgba(34, 198, 232, ${0.42 * pulse})`);
-    grad.addColorStop(1, 'rgba(34, 198, 232, 0)');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.ellipse(center.x, center.y, 50, 25, 0, 0, Math.PI * 2);
-    ctx.fill();
+    if (this.glowCyan) {
+      ctx.globalAlpha = pulse;
+      ctx.drawImage(this.glowCyan, center.x - 54, center.y - 28, 108, 56);
+      ctx.globalAlpha = 1;
+    }
 
-    // Swirling arcane floor rune ring
     ctx.strokeStyle = 'rgba(130, 248, 255, 0.85)';
     ctx.lineWidth = 2;
     ctx.setLineDash([8, 6]);
@@ -563,13 +784,10 @@ export class IsoRenderer {
       const img = this.atlas.rift;
       const drawH = 88;
       const drawW = drawH * (img.width / img.height);
-      ctx.save();
       ctx.drawImage(img, center.x - drawW * 0.5, center.y - drawH + 18 + bob * 0.5, drawW, drawH);
-      ctx.restore();
       return;
     }
 
-    // Fallback procedural crystal obelisk while loading
     const cy = center.y - 34 + bob;
     ctx.save();
     ctx.fillStyle = '#53e8ff';
@@ -593,25 +811,14 @@ export class IsoRenderer {
       const rx = d.radius * ISO_TILE_W * 0.45;
       const ry = d.radius * ISO_TILE_H * 0.45;
 
-      if (d.kind === 'scorch') {
-        const g = ctx.createRadialGradient(pos.x, pos.y, 2, pos.x, pos.y, rx);
-        g.addColorStop(0, `rgba(12, 10, 10, ${0.78 * fade})`);
-        g.addColorStop(0.62, `rgba(42, 22, 14, ${0.42 * fade})`);
-        g.addColorStop(1, 'rgba(12, 10, 10, 0)');
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.ellipse(pos.x, pos.y, rx, ry, 0, 0, Math.PI * 2);
-        ctx.fill();
-      } else if (d.kind === 'frost') {
-        const g = ctx.createRadialGradient(pos.x, pos.y, 4, pos.x, pos.y, rx);
-        g.addColorStop(0, `rgba(175, 246, 255, ${0.34 * fade})`);
-        g.addColorStop(0.7, `rgba(88, 212, 245, ${0.18 * fade})`);
-        g.addColorStop(1, 'rgba(88, 212, 245, 0)');
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.ellipse(pos.x, pos.y, rx, ry, 0, 0, Math.PI * 2);
-        ctx.fill();
+      if (d.kind === 'scorch' && this.decalScorch) {
+        ctx.globalAlpha = fade;
+        ctx.drawImage(this.decalScorch, pos.x - rx, pos.y - ry, rx * 2, ry * 2);
+      } else if (d.kind === 'frost' && this.decalFrost) {
+        ctx.globalAlpha = fade;
+        ctx.drawImage(this.decalFrost, pos.x - rx, pos.y - ry, rx * 2, ry * 2);
       } else if (d.kind === 'crack') {
+        ctx.globalAlpha = 1;
         ctx.strokeStyle = `rgba(12, 13, 18, ${0.58 * fade})`;
         ctx.lineWidth = 1.6;
         for (let k = 0; k < 5; k++) {
@@ -622,7 +829,7 @@ export class IsoRenderer {
           ctx.stroke();
         }
       } else {
-        // Ork battle splat
+        ctx.globalAlpha = 1;
         ctx.fillStyle = `rgba(34, 56, 26, ${0.42 * fade})`;
         ctx.beginPath();
         ctx.ellipse(pos.x, pos.y, rx, ry, 0, 0, Math.PI * 2);
@@ -642,16 +849,11 @@ export class IsoRenderer {
 
     if (trap.kind === 'tar') {
       ctx.save();
-      const grad = ctx.createRadialGradient(center.x, center.y, 4, center.x, center.y, 38);
-      grad.addColorStop(0, '#0f1218');
-      grad.addColorStop(0.7, '#1b2029');
-      grad.addColorStop(1, '#2b323e');
-      this.fillPoly(ctx, insetD, grad);
+      this.fillPoly(ctx, insetD, '#151921');
       ctx.strokeStyle = '#475366';
       ctx.lineWidth = 1.6;
       this.strokePoly(ctx, insetD);
 
-      // Glossy animated tar bubbles
       const b1 = 0.5 + 0.5 * Math.sin(time * 2.2 + trap.id);
       const b2 = 0.5 + 0.5 * Math.sin(time * 1.7 + trap.id * 2.3);
       ctx.fillStyle = 'rgba(148, 174, 204, 0.34)';
@@ -683,7 +885,6 @@ export class IsoRenderer {
           ctx.ellipse(p.x, p.y, 3.4, 1.9, 0, 0, Math.PI * 2);
           ctx.fill();
 
-          // Two-tone metallic steel spike
           ctx.fillStyle = trap.activeAnim > 0.15 ? '#ffd0a6' : readyGlow ? '#dce5ef' : '#656d7a';
           ctx.beginPath();
           ctx.moveTo(p.x - 2.8, p.y);
@@ -704,20 +905,11 @@ export class IsoRenderer {
       const plate = this.insetDiamond(getTileDiamond(trap.gx, trap.gy, lift), 0.13);
 
       this.fillPoly(ctx, insetD, '#152022');
-      const pGrad = ctx.createLinearGradient(
-        plate[0].x,
-        plate[0].y,
-        plate[2].x,
-        plate[2].y
-      );
-      pGrad.addColorStop(0, trap.cooldownTimer > 0 ? '#37504e' : '#3d8f85');
-      pGrad.addColorStop(1, trap.cooldownTimer > 0 ? '#233534' : '#235953');
-      this.fillPoly(ctx, plate, pGrad);
+      this.fillPoly(ctx, plate, trap.cooldownTimer > 0 ? '#2b403f' : '#2f726a');
       ctx.strokeStyle = trap.cooldownTimer > 0 ? '#5c7572' : '#7bf0d5';
       ctx.lineWidth = 2;
       this.strokePoly(ctx, plate);
 
-      // Bold luminous directional chevron
       const vec = CARDINAL_VECTORS[trap.facing];
       const pCenter = gridToIso(trap.gx + 0.5, trap.gy + 0.5, lift);
       const pTip = gridToIso(trap.gx + 0.5 + vec.dx * 0.32, trap.gy + 0.5 + vec.dy * 0.32, lift);
@@ -946,7 +1138,7 @@ export class IsoRenderer {
       }
     }
 
-    // 1. Walls & mounted Arrow Walls & Torches
+    // 1. Walls (single drawImage from cached wall sprites!) & mounted Arrow Walls & Torches
     for (let gy = 0; gy < rows; gy++) {
       for (let gx = 0; gx < cols; gx++) {
         const cell = grid[gy][gx];
@@ -956,19 +1148,12 @@ export class IsoRenderer {
         drawables.push({
           depth: gx + gy + 0.5,
           layer: 0,
-          draw: (c) =>
-            this.drawWallBlock(
-              c,
-              cell,
-              mounted,
-              sim.time,
-              isCutaway ? 16 : ISO_WALL_H
-            ),
+          draw: (c) => this.drawWallBlockFast(c, cell, mounted, sim.time, isCutaway),
         });
       }
     }
 
-    // 2. Arcane Rift Crystal Props (depth sorted properly with heroes/orks!)
+    // 2. Arcane Rift Crystal Props
     for (const rift of sim.map.rifts) {
       drawables.push({
         depth: rift.gx + rift.gy + 0.55,
@@ -1049,105 +1234,19 @@ export class IsoRenderer {
     return false;
   }
 
-  private drawWallBlock(
+  private drawWallBlockFast(
     ctx: CanvasRenderingContext2D,
     cell: Cell,
     wallTraps: PlacedTrap[] | undefined,
     time: number,
-    wallH = ISO_WALL_H
+    isCutaway: boolean
   ): void {
-    const { gx, gy } = cell;
-    const topD = getTileDiamond(gx, gy, wallH);
-    const seQuad = getWallFaceQuad(gx, gy, 'se', wallH);
-    const swQuad = getWallFaceQuad(gx, gy, 'sw', wallH);
-
-    // SW face (left vertical side — deep cool shadow + isometric sheared brick masonry!)
-    ctx.save();
-    this.tracePoly(ctx, swQuad);
-    ctx.clip();
-    if (this.wallPattern) {
-      ctx.save();
-      ctx.translate(swQuad[0].x, swQuad[0].y);
-      ctx.transform(1, 0.5, 0, 1, 0, 0);
-      ctx.scale(0.18, 0.18);
-      ctx.fillStyle = this.wallPattern;
-      ctx.fillRect(-40, -40, 420, 420);
-      ctx.restore();
-      const swShade = ctx.createLinearGradient(swQuad[0].x, swQuad[0].y, swQuad[2].x, swQuad[2].y);
-      swShade.addColorStop(0, 'rgba(18, 22, 32, 0.44)');
-      swShade.addColorStop(1, 'rgba(8, 10, 16, 0.68)');
-      ctx.fillStyle = swShade;
-      ctx.fill();
-    } else {
-      const swGrad = ctx.createLinearGradient(swQuad[0].x, swQuad[0].y, swQuad[2].x, swQuad[2].y);
-      swGrad.addColorStop(0, '#363b45');
-      swGrad.addColorStop(1, '#20242c');
-      this.fillPoly(ctx, swQuad, swGrad);
+    const cache = isCutaway ? this.wallCutawayCache : this.wallFullCache;
+    const sprite = cache[cell.variant % cache.length];
+    if (sprite) {
+      const center = gridToIso(cell.gx + 0.5, cell.gy + 0.5, 0);
+      ctx.drawImage(sprite.canvas, center.x - sprite.anchorX, center.y - sprite.anchorY);
     }
-    ctx.restore();
-
-    // SE face (right vertical side — warm stone midtone + isometric sheared brick masonry!)
-    ctx.save();
-    this.tracePoly(ctx, seQuad);
-    ctx.clip();
-    if (this.wallPattern) {
-      ctx.save();
-      ctx.translate(seQuad[1].x, seQuad[1].y);
-      ctx.transform(1, -0.5, 0, 1, 0, 0);
-      ctx.scale(0.18, 0.18);
-      ctx.fillStyle = this.wallPattern;
-      ctx.fillRect(-40, -40, 420, 420);
-      ctx.restore();
-      const seShade = ctx.createLinearGradient(seQuad[0].x, seQuad[0].y, seQuad[2].x, seQuad[2].y);
-      seShade.addColorStop(0, 'rgba(32, 34, 42, 0.22)');
-      seShade.addColorStop(1, 'rgba(12, 14, 20, 0.52)');
-      ctx.fillStyle = seShade;
-      ctx.fill();
-    } else {
-      const seGrad = ctx.createLinearGradient(seQuad[0].x, seQuad[0].y, seQuad[2].x, seQuad[2].y);
-      seGrad.addColorStop(0, '#4a505e');
-      seGrad.addColorStop(1, '#2c303a');
-      this.fillPoly(ctx, seQuad, seGrad);
-    }
-    ctx.restore();
-
-    // Top stone parapet cap with painterly flagstone texture
-    ctx.save();
-    this.tracePoly(ctx, topD);
-    ctx.clip();
-    if (this.floorPattern) {
-      ctx.save();
-      const c = gridToIso(gx + 0.5, gy + 0.5, wallH);
-      ctx.translate(c.x, c.y);
-      ctx.scale(0.24, 0.12);
-      ctx.rotate(Math.PI / 4);
-      ctx.fillStyle = this.floorPattern;
-      ctx.fillRect(-260, -260, 520, 520);
-      ctx.restore();
-      ctx.fillStyle =
-        wallH < ISO_WALL_H ? 'rgba(26, 30, 40, 0.42)' : 'rgba(66, 74, 92, 0.22)';
-      ctx.fill();
-    } else {
-      const capGrad = ctx.createLinearGradient(topD[3].x, topD[0].y, topD[1].x, topD[2].y);
-      capGrad.addColorStop(0, wallH < ISO_WALL_H ? '#4c525f' : '#626978');
-      capGrad.addColorStop(1, wallH < ISO_WALL_H ? '#373c46' : '#474d5a');
-      this.fillPoly(ctx, topD, capGrad);
-    }
-    ctx.restore();
-
-    // Crisp rim bevels & edge outlines
-    ctx.strokeStyle = 'rgba(236, 232, 222, 0.22)';
-    ctx.lineWidth = 1.25;
-    ctx.beginPath();
-    ctx.moveTo(topD[3].x, topD[3].y);
-    ctx.lineTo(topD[0].x, topD[0].y);
-    ctx.lineTo(topD[1].x, topD[1].y);
-    ctx.stroke();
-
-    ctx.strokeStyle = 'rgba(10, 12, 16, 0.72)';
-    ctx.lineWidth = 1.3;
-    this.strokePoly(ctx, swQuad);
-    this.strokePoly(ctx, seQuad);
 
     if (wallTraps) {
       for (const trap of wallTraps) {
@@ -1157,7 +1256,7 @@ export class IsoRenderer {
     }
 
     if (cell.torch) {
-      this.drawWallTorch(ctx, gx, gy, cell.torch, time);
+      this.drawWallTorch(ctx, cell.gx, cell.gy, cell.torch, time);
     }
   }
 
@@ -1233,7 +1332,6 @@ export class IsoRenderer {
     ctx.save();
     if (this.atlas.barricade) {
       const img = this.atlas.barricade;
-      // Soft contact shadow under barricade
       ctx.fillStyle = 'rgba(0, 0, 0, 0.48)';
       ctx.beginPath();
       ctx.ellipse(ground.x, ground.y + 3, 34, 17, 0, 0, Math.PI * 2);
@@ -1313,7 +1411,6 @@ export class IsoRenderer {
 
     ctx.save();
 
-    // Target lock reticle on auto-aimed Ork
     if (h.targetEnemyId !== null) {
       const target = sim.enemies.find((e) => e.id === h.targetEnemyId && !e.dead);
       if (target) {
@@ -1326,20 +1423,17 @@ export class IsoRenderer {
       }
     }
 
-    // Contact shadow
     ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
     ctx.beginPath();
     ctx.ellipse(base.x, base.y + 2, 18, 9.5, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Warmage glowing cyan command ring
     ctx.strokeStyle = h.dashTimer > 0 ? '#74ffe2' : 'rgba(98, 224, 255, 0.72)';
     ctx.lineWidth = 2.2;
     ctx.beginPath();
     ctx.ellipse(base.x, base.y + 1, 21, 11, 0, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Screen-space horizontal facing direction for sprite flipping
     const screenDirX = h.facingX - h.facingY;
     const flipX = screenDirX < -0.05;
 
@@ -1357,7 +1451,6 @@ export class IsoRenderer {
         h.castAnim > 0.6 ? 0.35 : 0
       );
 
-      // Subtle crossbow muzzle glint when firing
       if (h.recoilAnim > 0.35) {
         const tipX = base.x + (flipX ? -24 : 24);
         const tipY = base.y - 26 - bob;
@@ -1367,7 +1460,6 @@ export class IsoRenderer {
         ctx.fill();
       }
     } else {
-      // Fallback before sprite loads
       ctx.fillStyle = '#2458a6';
       ctx.beginPath();
       ctx.arc(base.x, base.y - 22 - bob, 13, 0, Math.PI * 2);
@@ -1393,7 +1485,6 @@ export class IsoRenderer {
 
     ctx.save();
 
-    // Soft grounded shadow scaled by altitude z
     ctx.fillStyle = `rgba(0, 0, 0, ${0.48 * shadowScale})`;
     ctx.beginPath();
     ctx.ellipse(
@@ -1407,7 +1498,6 @@ export class IsoRenderer {
     );
     ctx.fill();
 
-    // Tar slick clinging to feet
     if (enemy.tarTimer > 0 && !enemy.airborne) {
       ctx.fillStyle = 'rgba(18, 22, 28, 0.8)';
       ctx.beginPath();
@@ -1447,7 +1537,6 @@ export class IsoRenderer {
       ctx.fill();
     }
 
-    // Translucent frozen ice prism overlay
     if (enemy.freezeTimer > 0) {
       const fh = spriteH * 0.85;
       const fw = spriteH * 0.28;
@@ -1467,7 +1556,6 @@ export class IsoRenderer {
 
     ctx.restore();
 
-    // Crisp overhead HP bar (always for Ogre, or whenever damaged)
     const barTop = body.y - spriteH - 6;
     if (enemy.hp < enemy.maxHp || enemy.kind === 'ogre') {
       const bw = enemy.kind === 'ogre' ? 52 : 32;
@@ -1558,7 +1646,6 @@ export class IsoRenderer {
         ctx.save();
         ctx.globalAlpha = alpha;
 
-        // Carved stone gothic arch beam
         ctx.strokeStyle = '#242730';
         ctx.lineWidth = 13;
         ctx.lineCap = 'round';
@@ -1571,7 +1658,6 @@ export class IsoRenderer {
         ctx.lineWidth = 8.5;
         ctx.stroke();
 
-        // Brass keystone emblem
         ctx.fillStyle = '#d9a94e';
         ctx.beginPath();
         ctx.arc(centerTop.x, centerTop.y - 6, 4.2, 0, Math.PI * 2);
@@ -1667,146 +1753,69 @@ export class IsoRenderer {
   }
 
   /**
-   * Dynamic 2D Lightmap Pass:
-   * Renders torches, molten lava glow, Rift radiance, hero lantern, and active spells
-   * into a compact offscreen lightmap, multiplies it over the scene, and adds subtle bloom.
+   * High-FPS Localized Additive Lighting:
+   * Stamps pre-baked radial glow sprites in world space with 'lighter' blending —
+   * zero per-frame gradient allocations and zero expensive full-screen multiply readbacks!
    */
-  private drawDynamicLighting(
+  private drawFastAdditiveLighting(
     ctx: CanvasRenderingContext2D,
-    sim: GameSimulation,
-    viewportW: number,
-    viewportH: number,
-    shakeX: number,
-    shakeY: number
+    sim: GameSimulation
   ): void {
-    if (!this.lightCanvas || !this.lightCtx) return;
+    const { grid, rows, cols } = sim.map;
 
-    const scale = 0.35;
-    const lw = Math.max(64, Math.round(viewportW * scale));
-    const lh = Math.max(64, Math.round(viewportH * scale));
-    if (this.lightCanvas.width !== lw || this.lightCanvas.height !== lh) {
-      this.lightCanvas.width = lw;
-      this.lightCanvas.height = lh;
-    }
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
 
-    const lctx = this.lightCtx;
-    lctx.globalCompositeOperation = 'source-over';
-    // Balanced cool stone ambient so lighting has rich mood while staying vibrant on mobile screens
-    lctx.fillStyle = '#b8c2d6';
-    lctx.fillRect(0, 0, lw, lh);
-
-    lctx.globalCompositeOperation = 'lighter';
-
-    const addLight = (
+    const stamp = (
+      img: HTMLCanvasElement | null,
       gx: number,
       gy: number,
       z: number,
-      radiusWorld: number,
-      innerColor: string,
-      outerColor = 'rgba(0,0,0,0)'
-    ): Vec2 => {
-      const iso = gridToIso(gx, gy, z);
-      const sp = worldToScreen(iso.x, iso.y, sim.camera, viewportW, viewportH);
-      const sx = (sp.x + shakeX) * scale;
-      const sy = (sp.y + shakeY) * scale;
-      const sr = Math.max(8, radiusWorld * sim.camera.zoom * scale);
-
-      const g = lctx.createRadialGradient(sx, sy, 0, sx, sy, sr);
-      g.addColorStop(0, innerColor);
-      g.addColorStop(1, outerColor);
-      lctx.fillStyle = g;
-      lctx.beginPath();
-      lctx.arc(sx, sy, sr, 0, Math.PI * 2);
-      lctx.fill();
-      return { x: sp.x + shakeX, y: sp.y + shakeY };
+      radiusX: number,
+      radiusY: number,
+      alpha: number
+    ): void => {
+      if (!img) return;
+      const p = gridToIso(gx, gy, z);
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(img, p.x - radiusX, p.y - radiusY, radiusX * 2, radiusY * 2);
     };
-
-    const { grid, rows, cols } = sim.map;
-    const bloomSpots: Array<{ x: number; y: number; r: number; color: string }> = [];
 
     for (let gy = 0; gy < rows; gy++) {
       for (let gx = 0; gx < cols; gx++) {
         const cell = grid[gy][gx];
         if (cell.type === 'lava') {
           const pulse = 0.88 + 0.12 * Math.sin(sim.time * 2.8 + gx + gy);
-          const sp = addLight(gx + 0.5, gy + 0.5, 4, 108 * pulse, 'rgba(255, 118, 42, 0.36)');
-          bloomSpots.push({
-            x: sp.x,
-            y: sp.y,
-            r: 44 * sim.camera.zoom * pulse,
-            color: 'rgba(255, 118, 36, 0.14)',
-          });
-        } else if (cell.type === 'spawn') {
-          addLight(gx + 0.5, gy + 0.5, 10, 125, 'rgba(235, 72, 42, 0.48)');
+          stamp(this.glowLava, gx + 0.5, gy + 0.5, 4, 62 * pulse, 36 * pulse, 0.52);
         } else if (cell.type === 'rift') {
           const pulse = 0.9 + 0.1 * Math.sin(sim.time * 3.4);
-          const sp = addLight(gx + 0.5, gy + 0.5, 24, 170 * pulse, 'rgba(84, 242, 255, 0.72)');
-          bloomSpots.push({
-            x: sp.x,
-            y: sp.y,
-            r: 68 * sim.camera.zoom * pulse,
-            color: 'rgba(92, 242, 255, 0.22)',
-          });
+          stamp(this.glowCyan, gx + 0.5, gy + 0.5, 24, 96 * pulse, 68 * pulse, 0.72);
         }
-
         if (cell.torch) {
           const flicker = 0.9 + 0.1 * Math.sin(sim.time * 13 + gx * 3 + gy * 7);
-          const sp = addLight(
+          stamp(
+            this.glowAmber,
             gx + 0.5,
             gy + 0.5,
-            ISO_WALL_H * 0.6,
-            150 * flicker,
-            'rgba(255, 186, 86, 0.62)'
+            ISO_WALL_H * 0.55,
+            88 * flicker,
+            68 * flicker,
+            0.78
           );
-          bloomSpots.push({
-            x: sp.x,
-            y: sp.y,
-            r: 42 * sim.camera.zoom * flicker,
-            color: 'rgba(255, 184, 78, 0.2)',
-          });
         }
       }
     }
 
-    // Hero subtle arcane glow so Warmage always pops cleanly
-    addLight(sim.hero.gx, sim.hero.gy, 22, 125, 'rgba(130, 214, 255, 0.42)');
+    // Subtle Warmage arcane aura
+    stamp(this.glowCyan, sim.hero.gx, sim.hero.gy, 18, 48, 30, 0.24);
 
-    // Active projectiles & spell flashes
-    for (const p of sim.projectiles) {
-      addLight(
-        p.gx,
-        p.gy,
-        p.z,
-        55,
-        p.kind === 'hero_bolt' ? 'rgba(92, 240, 255, 0.45)' : 'rgba(255, 200, 96, 0.32)'
-      );
-    }
-
+    // Active spell flashes
     for (const r of sim.rings) {
       const a = Math.max(0, r.life / r.maxLife);
-      const col =
-        r.kind === 'frost'
-          ? `rgba(110, 242, 255, ${0.65 * a})`
-          : `rgba(255, 148, 56, ${0.75 * a})`;
-      addLight(r.gx, r.gy, 14, 165, col);
+      const glowImg = r.kind === 'frost' ? this.glowCyan : this.glowAmber;
+      stamp(glowImg, r.gx, r.gy, 12, 115, 72, a * 0.7);
     }
 
-    // 1. Multiply lightmap onto the scene
-    ctx.save();
-    ctx.globalCompositeOperation = 'multiply';
-    ctx.drawImage(this.lightCanvas, 0, 0, viewportW, viewportH);
-
-    // 2. Delicate additive bloom halos for emissive elements
-    ctx.globalCompositeOperation = 'lighter';
-    for (const b of bloomSpots) {
-      const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
-      g.addColorStop(0, b.color);
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
-      ctx.fill();
-    }
     ctx.restore();
   }
 
