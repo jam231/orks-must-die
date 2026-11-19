@@ -185,6 +185,16 @@ export interface RingEffect {
   dirY?: number;
 }
 
+export interface Decal {
+  gx: number;
+  gy: number;
+  radius: number;
+  kind: 'scorch' | 'frost' | 'splat' | 'crack';
+  life: number;
+  maxLife: number;
+  seed: number;
+}
+
 export interface FloatingText {
   gx: number;
   gy: number;

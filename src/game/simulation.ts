@@ -26,6 +26,7 @@ import {
 import {
   CARDINAL_VECTORS,
   CameraState,
+  Decal,
   ENEMY_SPECS,
   Enemy,
   EnemyKind,
@@ -77,6 +78,7 @@ export class GameSimulation {
   public projectiles: Projectile[] = [];
   public particles: Particle[] = [];
   public rings: RingEffect[] = [];
+  public decals: Decal[] = [];
   public floatingTexts: FloatingText[] = [];
 
   public flowField: FlowField;
@@ -167,6 +169,7 @@ export class GameSimulation {
     this.projectiles = [];
     this.particles = [];
     this.rings = [];
+    this.decals = [];
     this.floatingTexts = [];
     this.pendingSpawns = [];
     this.scheduledArrows = [];
@@ -614,6 +617,7 @@ export class GameSimulation {
     });
 
     this.spawnBurst(this.hero.gx, this.hero.gy, 18, '#8be9ff', 22, 2.8);
+    this.addDecal(this.hero.gx, this.hero.gy, 1.45, 'frost', 7.5);
 
     for (const enemy of this.enemies) {
       if (enemy.dead) continue;
@@ -923,6 +927,7 @@ export class GameSimulation {
             kind: 'pounder',
           });
           this.spawnBurst(trap.gx + 0.5, trap.gy + 0.5, 14, '#d9b58c', 16, 2.2);
+          this.addDecal(trap.gx + 0.5, trap.gy + 0.5, 0.85, 'crack', 14);
 
           for (const e of this.enemies) {
             if (e.dead) continue;
@@ -1307,6 +1312,7 @@ export class GameSimulation {
       kind: 'explosion',
     });
     this.spawnBurst(barricade.gx + 0.5, barricade.gy + 0.5, 22, '#ff8938', 24, 3.0);
+    this.addDecal(barricade.gx + 0.5, barricade.gy + 0.5, 1.15, 'scorch', 18);
 
     const dmg = ENEMY_SPECS.sapper.barricadeDamage;
     barricade.hp -= dmg;
@@ -1420,6 +1426,9 @@ export class GameSimulation {
     }
 
     this.spawnBurst(enemy.gx, enemy.gy, enemy.z + 18, '#6fb55e', 10, 1.8);
+    if (cause === 'normal') {
+      this.addDecal(enemy.gx, enemy.gy, enemy.kind === 'ogre' ? 0.65 : 0.42, 'splat', 16);
+    }
   }
 
   private checkWaveCompletion(): void {
@@ -1500,6 +1509,14 @@ export class GameSimulation {
       r.radius = r.maxRadius * (0.15 + 0.85 * prog);
     }
 
+    for (let i = this.decals.length - 1; i >= 0; i--) {
+      const d = this.decals[i];
+      d.life -= dt;
+      if (d.life <= 0) {
+        this.decals.splice(i, 1);
+      }
+    }
+
     for (let i = this.floatingTexts.length - 1; i >= 0; i--) {
       const ft = this.floatingTexts[i];
       ft.life -= dt;
@@ -1508,6 +1525,27 @@ export class GameSimulation {
         continue;
       }
       ft.z += ft.vy * dt;
+    }
+  }
+
+  public addDecal(
+    gx: number,
+    gy: number,
+    radius: number,
+    kind: Decal['kind'],
+    duration: number
+  ): void {
+    this.decals.push({
+      gx,
+      gy,
+      radius,
+      kind,
+      life: duration,
+      maxLife: duration,
+      seed: Math.random() * 100,
+    });
+    if (this.decals.length > 48) {
+      this.decals.shift();
     }
   }
 
